@@ -1,0 +1,1 @@
+# SQRT-Momentum-VIX-Trading-Strategy
