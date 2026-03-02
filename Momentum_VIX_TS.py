@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from collections import Counter
 
@@ -17,7 +19,7 @@ end_data   = "2023-12-31"
 treasury_ticker  = "BIL"
 benchmark_ticker = "SPY"
 
-transaction_cost_bps = 5
+transaction_cost_bps = 20
 tc = transaction_cost_bps / 10000.0
 
 # -------------------------------------------------------
@@ -31,7 +33,7 @@ skip_months               = 1
 # Volatility scaling — fixed architecture, dynamic sizing only
 TARGET_VOL = 0.15
 VOL_WINDOW = 21
-MAX_LEVER  = 2.0
+MAX_LEVER  = 1.0
 MIN_LEVER  = 0.5
 
 WFO_WINDOWS = [
@@ -83,7 +85,60 @@ USE_SECTOR_NEUTRALITY = len(sector_map) > 0
 
 
 # =========================
-# 1. LOAD PRICE PANEL
+# UTIL: POINT-IN-TIME S&P 500 MEMBERSHIP (SURVIVORSHIP BIAS FIX)
+# =========================
+
+HISTORICAL_COMPONENTS_CSV = "sp500_historical_components.csv"
+REMOVED_PRICES_CSV        = "sp500_removed_prices.csv"
+
+
+def load_historical_components(path=HISTORICAL_COMPONENTS_CSV):
+    """
+    Load point-in-time S&P 500 membership from the fja05680/sp500 dataset.
+    Returns sorted list of (Timestamp, set_of_tickers) for fast lookup.
+    Tickers are normalized to hyphen format (BF-B, BRK-B).
+    """
+    import bisect
+    try:
+        df = pd.read_csv(path)
+    except FileNotFoundError:
+        print(f"Warning: '{path}' not found -- point-in-time filter disabled.")
+        return [], []
+
+    entries = []
+    for _, row in df.iterrows():
+        dt = pd.to_datetime(row["date"])
+        tickers = set(
+            t.strip().replace(".", "-")
+            for t in str(row["tickers"]).split(",")
+        )
+        entries.append((dt, tickers))
+    entries.sort(key=lambda x: x[0])
+
+    dates_list = [e[0] for e in entries]
+    print(f"Loaded historical S&P 500 membership: {len(entries)} snapshots "
+          f"({entries[0][0].date()} to {entries[-1][0].date()}).")
+    return entries, dates_list
+
+
+_hist_entries, _hist_dates = load_historical_components()
+
+
+def eligible_tickers(as_of_date, available_columns):
+    """Return tickers from available_columns that were in the S&P 500
+    on as_of_date, using point-in-time historical membership data."""
+    import bisect
+    if not _hist_entries:
+        return list(available_columns)
+    idx = bisect.bisect_right(_hist_dates, as_of_date) - 1
+    if idx < 0:
+        return []
+    members = _hist_entries[idx][1]
+    return [t for t in available_columns if t in members]
+
+
+# =========================
+# 1. LOAD PRICE PANEL (including removed-stock prices)
 # =========================
 
 prices = pd.read_csv(PRICES_CSV, index_col=0, parse_dates=True)
@@ -93,9 +148,19 @@ prices = prices[
     (prices.index <= pd.to_datetime(end_data))
 ]
 
-min_obs    = 252
-valid_cols = prices.columns[prices.notna().sum() >= min_obs]
-prices     = prices[valid_cols]
+# Merge supplementary price data for stocks removed from S&P 500
+try:
+    removed_prices = pd.read_csv(REMOVED_PRICES_CSV, index_col=0, parse_dates=True)
+    removed_prices = removed_prices.sort_index()
+    if hasattr(removed_prices.index, "tz") and removed_prices.index.tz is not None:
+        removed_prices.index = removed_prices.index.tz_localize(None)
+    # Only add columns that don't already exist
+    new_cols = [c for c in removed_prices.columns if c not in prices.columns]
+    if new_cols:
+        prices = prices.join(removed_prices[new_cols], how="left")
+        print(f"Merged {len(new_cols)} removed-stock price series into panel.")
+except FileNotFoundError:
+    print("Warning: no supplementary removed-stock prices found.")
 
 print(f"Loaded prices: {prices.shape}")
 
@@ -158,6 +223,12 @@ for L in lookback_candidates:
         for dt in momentum.index:
             mom_row  = momentum.loc[dt]
             ts_row   = ts_mom_12.loc[dt]
+
+            # Point-in-time filter: only include tickers that were
+            # S&P 500 members on or before this rebalance date
+            eligible = eligible_tickers(dt, mom_row.index)
+            mom_row  = mom_row[eligible]
+            ts_row   = ts_row[eligible]
 
             # Only keep names with positive 12m TS momentum
             combined = mom_row[ts_row > 0].dropna()
@@ -234,9 +305,11 @@ print(
 #    It is now computed inside run_backtest() from pre-window history only.
 # =========================
 
-stock_rets     = prices.pct_change().fillna(0.0)
-treasury_rets  = treasury.pct_change().fillna(0.0)
-benchmark_rets = benchmark.pct_change().fillna(0.0)
+# fill_method=None avoids forward-filling sparse removed-stock prices
+# which would create spurious jumps when the next real price appears
+stock_rets     = prices.pct_change(fill_method=None).fillna(0.0)
+treasury_rets  = treasury.pct_change(fill_method=None).fillna(0.0)
+benchmark_rets = benchmark.pct_change(fill_method=None).fillna(0.0)
 
 realized_vol   = benchmark_rets.rolling(VOL_WINDOW).std() * np.sqrt(252)
 
@@ -296,16 +369,17 @@ def run_backtest(
     vix_pre = vix[vix.index < start_dt]
     rv_pre  = realized_vol[realized_vol.index < start_dt].dropna()
 
-    vix_threshold_local = (
-        float(vix_pre.quantile(vix_percentile))
-        if len(vix_pre) >= 60
-        else float(vix.quantile(vix_percentile))
-    )
-    rv_threshold_local = (
-        float(rv_pre.quantile(0.75))
-        if len(rv_pre) >= 60
-        else float(realized_vol.dropna().quantile(0.75))
-    )
+    if len(vix_pre) >= 2:
+        vix_threshold_local = float(vix_pre.quantile(vix_percentile))
+    else:
+        # No historical VIX data; use long-run median as conservative default
+        vix_threshold_local = 20.0
+
+    if len(rv_pre) >= 2:
+        rv_threshold_local = float(rv_pre.quantile(0.75))
+    else:
+        # No historical RV data; use long-run equity vol as conservative default
+        rv_threshold_local = 0.20
 
     # ------------------------------------------------------------------
     # Dual regime: risk-off when VIX or realized vol is elevated
@@ -515,7 +589,8 @@ if chosen_params:
 else:
     vix_pct_mode = 0.75
 
-vix_threshold = float(vix.quantile(vix_pct_mode))
+vix_oos = vix.reindex(portfolio_ret_bt.index).dropna()
+vix_threshold = float(vix_oos.quantile(vix_pct_mode))
 print(
     f"\nvix_threshold exported for stats module: "
     f"pct={vix_pct_mode} -> absolute={vix_threshold:.1f}"
@@ -533,9 +608,10 @@ print(
 #                               not by stock selection
 # =========================
 
+rv_oos = realized_vol.reindex(portfolio_ret_bt.index).dropna()
 risk_off_mask = (
     (vix > vix_threshold) |
-    (realized_vol > realized_vol.dropna().quantile(vix_pct_mode))
+    (realized_vol > rv_oos.quantile(vix_pct_mode))
 ).reindex(portfolio_ret_bt.index).fillna(False)
 
 strat_risk_on  = portfolio_ret_bt[~risk_off_mask].dropna()

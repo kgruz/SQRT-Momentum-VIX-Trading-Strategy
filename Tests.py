@@ -8,6 +8,8 @@ If the strategy is overfit or fragile, these will show it.
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from math import erf, sqrt
@@ -190,7 +192,7 @@ def load_qqq_for_strategy(strat: pd.Series) -> pd.Series:
     close.index = pd.to_datetime(close.index)
 
     q_ret = close.pct_change()
-    q_ret = q_ret.reindex(strat.index).fillna(0.0)
+    q_ret = q_ret.reindex(strat.index).dropna()
     return q_ret
 
 
